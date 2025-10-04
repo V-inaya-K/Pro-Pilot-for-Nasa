@@ -1,35 +1,38 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 from datetime import datetime, timezone
-import uuid
-import os
-import io
-import logging
-import PyPDF2
-from dotenv import load_dotenv
+import uuid, os, io, logging
+import PyPDF2, requests
 from motor.motor_asyncio import AsyncIOMotorClient
-import google.generativeai as genai
 from contextlib import asynccontextmanager
-import httpx
-from bs4 import BeautifulSoup
+from groq import Groq
+from dotenv import load_dotenv
 
 # ---------------- Load environment ----------------
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
-print("API key loaded?", os.getenv("GOOGLE_API_KEY") is not None)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set in .env")
+
+client_llm = Groq(api_key=GROQ_API_KEY)
+print("Groq API key loaded:", GROQ_API_KEY is not None)
 
 # ---------------- MongoDB setup ----------------
-mongo_url = os.environ.get("MONGO_URL")
-db_name = os.environ.get("DB_NAME")
-client = AsyncIOMotorClient(mongo_url)
-db = client[db_name]
+mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+db_name = os.environ.get("DB_NAME", "propilot")
+client_db = AsyncIOMotorClient(mongo_url)
+db = client_db[db_name]
 
-# ---------------- Google Gen AI ----------------
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# ---------------- NASA OSDR API ----------------
+SEARCH_API_URL = "https://osdr.nasa.gov/osdr/data/search"
+METADATA_API_URL = "https://osdr.nasa.gov/osdr/data/osd/meta"
 
 # ---------------- FastAPI setup ----------------
 @asynccontextmanager
@@ -38,10 +41,23 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        client.close()
+        client_db.close()
 
 app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
+
+# ---------------- CORS ----------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # ---------------- Models ----------------
 class User(BaseModel):
@@ -56,12 +72,13 @@ class UserCreate(BaseModel):
 
 class Document(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
+    user_id: str  # reference to users.id
     filename: str
     content: str
     summary: str = ""
     summary_hindi: str = ""
     summary_punjabi: str = ""
+    doi_link: Optional[str] = None
     upload_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     file_type: str
 
@@ -95,7 +112,6 @@ def extract_text_from_pdf(file_content: bytes) -> str:
         raise HTTPException(status_code=400, detail=f"Error extracting PDF: {str(e)}")
 
 MAX_CHARS = 4000
-
 def chunk_text(text: str, max_chars: int = MAX_CHARS):
     chunks = []
     start = 0
@@ -124,29 +140,24 @@ async def generate_summary(content: str, language: str = "english", tone: str = 
     for chunk in chunks:
         prompt = prompt_template.format(style=style) + "\n\n" + chunk
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
-            if hasattr(response, "candidates") and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, "content"):
-                    if hasattr(candidate.content, "text"):
-                        summaries.append(candidate.content.text)
-                    elif hasattr(candidate.content, "parts") and candidate.content.parts:
-                        summaries.append(candidate.content.parts[0].text)
-                    else:
-                        summaries.append(str(candidate.content))
-                else:
-                    summaries.append(str(candidate))
-            elif hasattr(response, "text"):
-                summaries.append(response.text)
+            completion = client_llm.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_completion_tokens=1024
+            )
+            if completion.choices:
+                summaries.append(completion.choices[0].message.content)
             else:
-                summaries.append(str(response))
+                summaries.append("No summary generated.")
         except Exception as e:
+            logger.exception("Error generating summary with Groq")
             summaries.append(f"Error: {str(e)}")
 
     return "\n".join(summaries)
 
-async def get_answer(document_content: str, question: str, language: str = "english", tone: str = "professional") -> str:
+async def get_answer(document_content: str, question: str, previous_chats: List[ChatMessage] = None,
+                     language: str = "english", tone: str = "professional") -> str:
     tone_map = {
         "professional": "clear, professional",
         "friendly": "friendly and approachable",
@@ -154,65 +165,38 @@ async def get_answer(document_content: str, question: str, language: str = "engl
     }
     style = tone_map.get(tone, "clear, professional")
 
-    prompts = {
-        "english": f"Based on the following research paper, answer this question in {style} English: {question}\n\n{document_content}",
-        "hindi": f"निम्नलिखित शोध पत्र के आधार पर इस प्रश्न का उत्तर {style} हिंदी में दें: {question}\n\n{document_content}",
-        "punjabi": f"ਹੇਠ ਲਿਖੇ ਰਿਸਰਚ ਪੇਪਰ ਦੇ ਆਧਾਰ 'ਤੇ ਇਸ ਸਵਾਲ ਦਾ ਜਵਾਬ {style} ਪੰਜਾਬੀ ਵਿੱਚ ਦਿਓ: {question}\n\n{document_content}"
-    }
+    messages = []
+    if previous_chats:
+        for chat in previous_chats:
+            messages.append({"role": "user", "content": chat.question})
+            messages.append({"role": "assistant", "content": chat.answer})
 
-    prompt = prompts.get(language, prompts["english"])
+    messages.append({"role": "user", "content": f"Based on the following research paper, answer in {style} {language}: {question}\n\n{document_content}"})
+
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        if hasattr(response, "text"):
-            return response.text
-        elif hasattr(response, "candidates") and response.candidates:
-            return response.candidates[0].content.parts[0].text
-        else:
-            return "No answer generated."
+        completion = client_llm.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_completion_tokens=1024
+        )
+        if completion.choices:
+            return completion.choices[0].message.content
+        return "No answer generated."
     except Exception as e:
+        logger.exception("Error getting answer from Groq")
         return f"Error getting answer: {str(e)}"
 
 # ---------------- API Routes ----------------
-@api_router.get("/genelab_search")
-async def genelab_search(query: str):
-    """
-    Scrapes NASA science data site and returns results matching query
-    """
-    url = "https://science.nasa.gov/biological-physical/data/"
-    headers = {"User-Agent": "ProPilotApp/1.0"}
-    try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            html = response.text
 
-        # Parse HTML for links containing the query
-        soup = BeautifulSoup(html, "html.parser")
-        datasets = []
-        for link in soup.select("a"):
-            title = link.get_text(strip=True)
-            href = link.get("href")
-            if query.lower() in title.lower() and href:
-                datasets.append({"title": title, "link": href})
-
-        return {"results": datasets}
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"Error fetching GeneLab data: {str(e)}"})
-
-
+# 1) Users
 @api_router.post("/users", response_model=User)
 async def create_user(user_data: UserCreate):
     existing = await db.users.find_one({"email": user_data.email})
     if existing:
         if user_data.interests:
-            await db.users.update_one(
-                {"email": user_data.email},
-                {"$set": {"interests": user_data.interests}}
-            )
+            await db.users.update_one({"email": user_data.email}, {"$set": {"interests": user_data.interests}})
         return User(**existing)
-
     user_obj = User(email=user_data.email, **({"interests": user_data.interests} if user_data.interests else {}))
     await db.users.insert_one(user_obj.dict())
     return user_obj
@@ -224,16 +208,106 @@ async def get_user(email: str):
         raise HTTPException(status_code=404, detail="User not found")
     return User(**user)
 
+# 2) Search studies
+@api_router.get("/search")
+async def search_studies(term: str = Query(...), from_page: int = Query(0), size: int = Query(50)):
+    params = {"term": term, "from": from_page, "size": size, "type": "cgene"}
+    try:
+        resp = requests.get(SEARCH_API_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for hit in data.get("hits", {}).get("hits", []):
+            study = hit.get("_source", {})
+            results.append({
+                "OSD_ID": study.get("Study Identifier") or study.get("Accession"),
+                "title": study.get("Study Title"),
+                "description": study.get("Study Description")
+            })
+        total = data.get("hits", {}).get("total", 0)
+        return {"total_hits": total, "results": results}
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"NASA Search API error: {e} — returning mock results")
+        mock = [
+            {"OSD_ID": "MOCK-OSD-1", "title": "Space Nutrition Study (mock)", "description": "Mock description: nutrition in microgravity."},
+            {"OSD_ID": "MOCK-OSD-2", "title": "Microgravity Muscle Effects (mock)", "description": "Mock description: musculoskeletal changes."},
+            {"OSD_ID": "MOCK-OSD-3", "title": "Astrobiology Discoveries (mock)", "description": "Mock description: extremophiles and biosignatures."}
+        ]
+        return {"total_hits": len(mock), "results": mock}
+
+# 3) Metadata
+@api_router.get("/metadata/{osd_id}")
+async def get_metadata(osd_id: str, lang: str = Query("english", regex="^(english|hindi|punjabi)$")):
+    if osd_id.upper().startswith("OSD-"):
+        osd_id = osd_id.split("-", 1)[1]
+
+    try:
+        resp = requests.get(f"{METADATA_API_URL}/{osd_id}", timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        study_container = data.get("study", {})
+        study_key = f"OSD-{osd_id}"
+        study_data = study_container.get(study_key, {}) if study_container else {}
+        study_main = study_data.get("studies", [{}])[0] if isinstance(study_data, dict) else {}
+
+        description = study_main.get("description") or study_main.get("Study Description") or study_main.get("summary") or ""
+
+        # Translate if not English
+        if lang != "english" and description:
+            translation_prompt = {
+                "hindi": f"Translate the following text into Hindi:\n\n{description}",
+                "punjabi": f"Translate the following text into Punjabi:\n\n{description}"
+            }
+            try:
+                completion = client_llm.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[{"role": "user", "content": translation_prompt[lang]}],
+                    temperature=0.7,
+                    max_completion_tokens=1024
+                )
+                if completion.choices:
+                    description = completion.choices[0].message.content
+            except Exception as e:
+                logger.warning(f"Error translating metadata to {lang}: {e}")
+
+        # Add dummy DOI if none exists
+        doi_link = study_main.get("doi") or study_main.get("DOI") or "https://www.mdpi.com/1422-0067/18/8/1763"
+
+        response_payload = {
+            "OSD_ID": osd_id,
+            "title": study_main.get("title") or study_data.get("title"),
+            "description": description,
+            "assays": list(study_data.get("additionalInformation", {}).get("assays", {}).keys()) if isinstance(study_data.get("additionalInformation", {}), dict) else [],
+            "submission_date": study_main.get("submissionDate"),
+            "doi_link": doi_link,
+            "public_release_date": study_main.get("publicReleaseDate")
+        }
+        return response_payload
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"NASA Metadata API error: {e}")
+        raise HTTPException(status_code=500, detail="NASA Metadata API error")
+    except Exception as e:
+        logger.exception("Unexpected error in metadata endpoint")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 4) Upload document
 @api_router.post("/upload")
-async def upload_document(file: UploadFile = File(...), user_id: str = Form(...), tone: str = Form("professional")):
+async def upload_document(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    tone: str = Form("professional"),
+    doi_link: Optional[str] = Form(None)
+):
+    # Validate user
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
+    
     content = await file.read()
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
+    
     text_content = extract_text_from_pdf(content)
     if not text_content.strip():
         raise HTTPException(status_code=400, detail="No text extracted")
@@ -249,6 +323,7 @@ async def upload_document(file: UploadFile = File(...), user_id: str = Form(...)
         summary=summary_en,
         summary_hindi=summary_hi,
         summary_punjabi=summary_pa,
+        doi_link=doi_link,
         file_type="pdf"
     )
     await db.documents.insert_one(document.dict())
@@ -257,8 +332,10 @@ async def upload_document(file: UploadFile = File(...), user_id: str = Form(...)
         "document_id": document.id,
         "message": "Document uploaded and summarized",
         "summary": {"english": summary_en, "hindi": summary_hi, "punjabi": summary_pa},
+        "doi_link": doi_link
     }
 
+# 5) Documents endpoints
 @api_router.get("/documents/{user_id}", response_model=List[Document])
 async def get_user_documents(user_id: str):
     docs = await db.documents.find({"user_id": user_id}).to_list(length=None)
@@ -271,13 +348,21 @@ async def get_document(document_id: str):
         raise HTTPException(status_code=404, detail="Document not found")
     return Document(**doc)
 
+# 6) Chat endpoints
 @api_router.post("/chat", response_model=ChatMessage)
 async def ask_question(chat_request: ChatRequest):
     document = await db.documents.find_one({"id": chat_request.document_id})
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-
-    answer = await get_answer(document["content"], chat_request.question, chat_request.language, chat_request.tone)
+    
+    prev_msgs_data = await db.chat_messages.find({
+        "document_id": chat_request.document_id,
+        "user_id": chat_request.user_id
+    }).sort("timestamp", 1).to_list(length=None)
+    
+    prev_msgs = [ChatMessage(**m) for m in prev_msgs_data]
+    answer = await get_answer(document["content"], chat_request.question, prev_msgs, chat_request.language, chat_request.tone)
+    
     chat_message = ChatMessage(
         document_id=chat_request.document_id,
         user_id=chat_request.user_id,
@@ -293,16 +378,10 @@ async def get_chat_history(document_id: str, user_id: str):
     msgs = await db.chat_messages.find({"document_id": document_id, "user_id": user_id}).sort("timestamp", 1).to_list(length=None)
     return [ChatMessage(**msg) for msg in msgs]
 
-# ---------------- App setup ----------------
+# ---------------- Include router ----------------
 app.include_router(api_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # allow all origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ---------------- Entrypoint ----------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
