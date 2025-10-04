@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NASA Bioscience Research Search</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    #searchBar { width: 300px; padding: 8px; }
+    #results { margin-top: 20px; display: flex; flex-direction: column; gap: 10px; }
+    .result { border: 1px solid #ccc; padding: 10px; border-radius: 5px; }
+    .result a { color: #0077cc; text-decoration: none; }
+  </style>
+</head>
+<body>
+
+<h2>Search NASA Bioscience Research</h2>
+<input type="text" id="searchBar" placeholder="Enter keyword (e.g., microgravity)">
+<div id="results"></div>
+
+<script>
+// Initialize an empty array to store dataset metadata
+let datasets = [];
+
+// Fetch metadata for all datasets from the OSDR API
+async function fetchDatasets() {
+  try {
+    const response = await fetch('https://visualization.osdr.nasa.gov/biodata/api/v2/query/?format=json&limit=1000');
+    const data = await response.json();
+    datasets = data;
+    document.getElementById('results').innerHTML = '<p>Datasets loaded. Start typing to search.</p>';
+  } catch (err) {
+    console.error('Failed to fetch datasets', err);
+    document.getElementById('results').innerHTML = '<p>Error loading datasets.</p>';
+  }
+}
+
+// Search function to filter datasets based on the keyword
+function searchDatasets(keyword) {
+  if (!keyword) return [];
+  const lowerKeyword = keyword.toLowerCase();
+  return datasets.filter(d =>
+    (d.title && d.title.toLowerCase().includes(lowerKeyword)) ||
+    (d.description && d.description.toLowerCase().includes(lowerKeyword)) ||
+    (d.mission && d.mission.toLowerCase().includes(lowerKeyword))
+  );
+}
+
+// Render the search results in the UI
+function renderResults(results) {
+  const resultsContainer = document.getElementById('results');
+  resultsContainer.innerHTML = '';
+  if (results.length === 0) {
+    resultsContainer.innerHTML = '<p>No results found.</p>';
+    return;
+  }
+  results.forEach(d => {
+    const div = document.createElement('div');
+    div.className = 'result';
+    div.innerHTML = `
+      <strong>Title:</strong> ${d.title || 'N/A'}<br>
+      <strong>Mission:</strong> ${d.mission || 'N/A'}<br>
+      <strong>Description:</strong> ${d.description ? d.description.substring(0, 200) + '...' : 'N/A'}<br>
+      <a href="https://genelab.nasa.gov/Download/${d.accession || '#'}" target="_blank">View Dataset</a>
+    `;
+    resultsContainer.appendChild(div);
+  });
+}
+
+// Event listener for live search functionality
+document.getElementById('searchBar').addEventListener('input', (e) => {
+  const keyword = e.target.value.trim();
+  const results = searchDatasets(keyword);
+  renderResults(results);
+});
+
+// Initialize by fetching datasets
+fetchDatasets();
+</script>
+
+</body>
+</html>

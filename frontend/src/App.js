@@ -14,6 +14,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [email, setEmail] = useState("");
   const [documents, setDocuments] = useState([]);
+  const [searchResults, setSearchResults] = useState([]);
   const [selectedDocument, setSelectedDocument] = useState(null);
   const [question, setQuestion] = useState("");
   const [language, setLanguage] = useState("english");
@@ -24,6 +25,12 @@ function App() {
   const [searchInterest, setSearchInterest] = useState("");
   const [selectedInterests, setSelectedInterests] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState("");
+  const [isSignup, setIsSignup] = useState(false);
+  const [recentSearches, setRecentSearches] = useState([]);
+
+  // Full-screen overlay states (login-style screen)
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [overlayResults, setOverlayResults] = useState([]);
 
   const availableInterests = [
     "Human Physiology in Space","Cellular Biology","Microgravity Effects",
@@ -44,40 +51,103 @@ function App() {
     }
   };
 
+  // ---------------- User / Auth ----------------
   const handleLogin = async () => {
     if (!email) return;
     try {
       const response = await axios.post(`${API}/users`, { 
         email,
-        interests: selectedInterests
+        interests: isSignup ? selectedInterests : []
       });
       setUser(response.data);
       loadUserDocuments(response.data.id);
     } catch (error) {
       console.error("Error creating/getting user:", error);
+      alert("Error logging in: " + (error.response?.data?.detail || error.message));
     }
   };
 
   const loadUserDocuments = async (userId) => {
     try {
       const response = await axios.get(`${API}/documents/${userId}`);
-      setDocuments(response.data);
+      setDocuments(response.data || []);
     } catch (error) {
       console.error("Error loading documents:", error);
     }
   };
 
+  // ---------------- GeneLab / OSDR Search (returns array) ----------------
+  const searchResearchPapers = async (query) => {
+    try {
+      // Use your backend route that proxies GeneLab / NASA OSDR / PSI
+      const res = await axios.get(`${API}/genelab_search`, { params: { query } });
+      // Some backends return { results: [...] } or an array directly — handle both.
+      if (!res || !res.data) return [];
+      const results = Array.isArray(res.data) ? res.data : (res.data.results || []);
+      return results || [];
+    } catch (err) {
+      console.error("Error fetching GeneLab/OSDR data:", err);
+      return [];
+    }
+  };
+
+  // Called when user presses the Search button
+  const handleSearch = async () => {
+    if (!searchInterest.trim()) return;
+    const results = await searchResearchPapers(searchInterest);
+    setSearchResults(results || []);
+
+    if (results && results.length > 0) {
+      // show full-screen overlay (login-style) with results list
+      setOverlayResults(results);
+      setShowOverlay(true);
+    } else {
+      alert("No publications found for that keyword.");
+    }
+
+    // store simple recent search (title = query)
+    setRecentSearches(prev => {
+      const exists = prev.find(s => s.title === searchInterest);
+      if (exists) return prev;
+      return [{ id: Date.now(), title: searchInterest }, ...prev].slice(0, 10);
+    });
+  };
+
+  // ---------------- Document selection & Chat ----------------
   const selectDocument = async (doc) => {
     setSelectedDocument(doc);
-    setCurrentSummary({
-      english: doc.summary,
-      hindi: doc.summary_hindi,
-      punjabi: doc.summary_punjabi,
+    setShowOverlay(false);
+
+    // save in recent searches (use doc.title)
+    setRecentSearches(prev => {
+      const title = doc.title || doc.filename || (doc.name || "").toString();
+      const exists = prev.find((s) => s.title === title);
+      if (exists) return prev;
+      return [{ id: Date.now(), title }, ...prev].slice(0, 10);
     });
-    try {
-      const response = await axios.get(`${API}/chat/${doc.id}/${user.id}`);
-      setChatHistory(response.data);
-    } catch {
+
+    if (doc.summary) {
+      setCurrentSummary({
+        english: doc.summary || "No summary available",
+        hindi: doc.summary_hindi || "No summary available",
+        punjabi: doc.summary_punjabi || "No summary available",
+      });
+    } else {
+      setCurrentSummary({
+        english: doc.title || "No summary available",
+        hindi: doc.title || "No summary available",
+        punjabi: doc.title || "No summary available",
+      });
+    }
+
+    if (user && doc.id) {
+      try {
+        const response = await axios.get(`${API}/chat/${doc.id}/${user.id}`);
+        setChatHistory(response.data || []);
+      } catch (err) {
+        setChatHistory([]);
+      }
+    } else {
       setChatHistory([]);
     }
   };
@@ -92,7 +162,7 @@ function App() {
         question,
         language,
       });
-      setChatHistory([...chatHistory, response.data]);
+      setChatHistory([...(chatHistory || []), response.data]);
       setQuestion("");
     } catch (error) {
       alert("Error asking question: " + (error.response?.data?.detail || error.message));
@@ -111,14 +181,14 @@ function App() {
     if (!currentSummary) return;
     const text = currentSummary[language] || currentSummary.english;
     if (navigator.share) {
-      navigator.share({ title: selectedDocument.filename, text });
+      navigator.share({ title: selectedDocument?.filename || selectedDocument?.title, text });
     } else {
       navigator.clipboard.writeText(text);
       alert("Summary copied to clipboard!");
     }
   };
 
-  // --- LOGIN SCREEN ---
+  // ---------------- LOGIN / SIGNUP SCREEN ----------------
   if (!user) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-b from-gray-900 via-blue-950 to-gray-900 relative overflow-hidden">
@@ -127,41 +197,71 @@ function App() {
           <div className="mb-6">
             <img src="https://www.nasa.gov/wp-content/themes/nasa/assets/images/nasa-logo.svg" alt="NASA Logo" className="mx-auto h-16 mb-2" />
             <h1 className="text-white text-2xl font-bold">PRO PILOT</h1>
-            <p className="text-blue-200 text-sm">WELCOME TO A NEW ERA OF DISCOVERY</p>
+            <p className="text-blue-200 text-sm">{isSignup ? "CREATE A NEW ACCOUNT" : "WELCOME BACK"}</p>
           </div>
+
           <div className="space-y-4">
-            <input type="email" placeholder="Enter your email" value={email} onChange={(e) => setEmail(e.target.value)}
+            <input
+              type="email"
+              placeholder="Enter your email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
               className="w-full px-4 py-3 rounded-lg bg-white/10 border border-white/20 text-white placeholder-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400"
             />
-            <input type="text" placeholder="Search interests..." value={searchInterest} onChange={(e) => setSearchInterest(e.target.value)}
-              className="w-full px-4 py-3 rounded-lg bg-white/10 border border-white/20 text-white placeholder-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400"
-            />
-            <div className="flex flex-wrap gap-2 max-h-24 overflow-y-auto">
-              {availableInterests.filter((i) => i.toLowerCase().includes(searchInterest.toLowerCase()))
-                .sort((a, b) => selectedInterests.includes(a) && !selectedInterests.includes(b) ? -1 : 0)
-                .map((interest) => (
-                  <button key={interest} onClick={() => toggleInterest(interest)}
-                    className={`px-3 py-1 rounded-full text-sm border transition-colors ${
-                      selectedInterests.includes(interest)
-                        ? "bg-blue-600 text-white border-blue-400"
-                        : "bg-white/5 text-blue-200 border-white/20 hover:bg-white/20"
-                    }`}
-                  >{interest}</button>
-                ))}
-            </div>
-            <button onClick={handleLogin} className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg shadow-lg transition-all">
-              LOGIN
+
+            {isSignup && (
+              <>
+                <input
+                  type="text"
+                  placeholder="Search interests..."
+                  value={searchInterest}
+                  onChange={(e) => setSearchInterest(e.target.value)}
+                  className="w-full px-4 py-3 rounded-lg bg-white/10 border border-white/20 text-white placeholder-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                />
+                <div className="flex flex-wrap gap-2 max-h-24 overflow-y-auto">
+                  {availableInterests
+                    .filter((i) => i.toLowerCase().includes(searchInterest.toLowerCase()))
+                    .sort((a, b) => selectedInterests.includes(a) && !selectedInterests.includes(b) ? -1 : 0)
+                    .map((interest) => (
+                      <button
+                        key={interest}
+                        onClick={() => toggleInterest(interest)}
+                        className={`px-3 py-1 rounded-full text-sm border transition-colors ${
+                          selectedInterests.includes(interest)
+                            ? "bg-blue-600 text-white border-blue-400"
+                            : "bg-white/5 text-blue-200 border-white/20 hover:bg-white/20"
+                        }`}
+                      >
+                        {interest}
+                      </button>
+                    ))}
+                </div>
+              </>
+            )}
+
+            <button
+              onClick={handleLogin}
+              className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg shadow-lg transition-all"
+            >
+              {isSignup ? "SIGN UP" : "LOGIN"}
             </button>
+
+            <p className="text-blue-200 text-sm mt-4">
+              {isSignup ? "Already have an account?" : "Don’t have an account?"}{" "}
+              <button
+                onClick={() => setIsSignup(!isSignup)}
+                className="text-white hover:underline"
+              >
+                {isSignup ? "Login" : "Sign up"}
+              </button>
+            </p>
           </div>
-          <p className="text-blue-200 text-sm mt-6">
-            Don’t have an account? <a href="#" className="text-white hover:underline">Sign up</a>
-          </p>
         </div>
       </div>
     );
   }
 
-  // --- DASHBOARD WITH ROUTER ---
+  // ---------------- DASHBOARD ----------------
   return (
     <Router>
       <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-950 to-gray-900 flex flex-col pt-20">
@@ -199,15 +299,13 @@ function App() {
         </div>
         <br/>
 
-
         {/* MAIN CONTENT */}
         <div className="flex-1 max-w-7xl mx-auto p-6">
           <Routes>
             <Route path="/" element={
-
               <div className="flex-1 max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-                {/* LEFT PANEL - SEARCH & RECENT SEARCHES */}
+                {/* LEFT PANEL - SEARCH & RECENT */}
                 <div className="space-y-6">
                   <div className="bg-white/10 backdrop-blur-md rounded-xl p-6 border border-white/10">
                     <h2 className="text-xl font-semibold text-white mb-4">Search Research Papers</h2>
@@ -246,18 +344,41 @@ function App() {
                       <input type="text" placeholder="Author" className="w-full px-3 py-2 rounded-lg bg-gray-800 text-white placeholder-blue-200" />
                     </div>
 
-                    <button onClick={() => {}} className="mt-3 w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Search</button>
+                    <button onClick={handleSearch} className="mt-3 w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Search</button>
                   </div>
 
                   <div className="bg-white/10 backdrop-blur-md rounded-xl p-6 border border-white/10 max-h-[400px] overflow-y-auto">
                     <h2 className="text-xl font-semibold text-white mb-4">Recent Searches</h2>
-                    {documents.slice(-4).map((doc) => (
-                      <div key={doc.id} className="p-2 text-blue-200 hover:text-white cursor-pointer border-b border-white/10"
-                        onClick={() => selectDocument(doc)}
-                      >
-                        {doc.filename}
+
+                    {/* Live search suggestions */}
+                    {searchInterest && searchResults.length > 0 && (
+                      <div className="mb-3">
+                        <p className="text-blue-300 mb-1">Suggestions:</p>
+                        {searchResults.map(result => (
+                          <div key={result.id || result.title} className="p-2 text-blue-200 hover:text-white cursor-pointer border-b border-white/10"
+                            onClick={() => selectDocument(result)}
+                          >
+                            {result.title || result.name || result.filename}
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
+
+                    {/* Past searches */}
+                    {recentSearches.length === 0 ? (
+                      <p className="text-blue-200 text-center py-4">No recent searches</p>
+                    ) : (
+                      recentSearches.map(search => (
+                        <div key={search.id} className="p-2 text-blue-200 hover:text-white cursor-pointer border-b border-white/10"
+                          onClick={() => {
+                            setSearchInterest(search.title);
+                            handleSearch();
+                          }}
+                        >
+                          {search.title}
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
 
@@ -266,14 +387,16 @@ function App() {
                   <h2 className="text-xl font-semibold text-white mb-4">Summary</h2>
                   {currentSummary ? (
                     <div className="flex-1 flex flex-col space-y-4 overflow-y-auto">
-                      <p className="text-blue-200 whitespace-pre-wrap">{currentSummary[language]}</p>
+                      <p className="text-blue-200 whitespace-pre-wrap">
+                        {currentSummary[language] || currentSummary.english}
+                      </p>
                       <div className="flex space-x-2">
                         <button onClick={handleCopySummary} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded-lg">Copy</button>
                         <button onClick={handleShareSummary} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded-lg">Share</button>
                       </div>
                     </div>
                   ) : (
-                    <p className="text-blue-200 text-center py-12">Select a document to view its summary</p>
+                    <p className="text-blue-200 text-center py-12">Select a research to view its summary</p>
                   )}
                 </div>
 
@@ -281,11 +404,11 @@ function App() {
                 <div className="bg-white/10 backdrop-blur-md rounded-xl p-6 border border-white/10 flex flex-col max-h-[400px]">
                   <h2 className="text-xl font-semibold text-white mb-4">Ask Questions</h2>
                   <div className="flex-1 bg-gray-800/50 p-3 rounded-lg overflow-y-auto space-y-3">
-                    {chatHistory.length === 0 ? (
-                      <p className="text-blue-300 text-center py-8">Ask questions about the document</p>
+                    {(!chatHistory || chatHistory.length === 0) ? (
+                      <p className="text-blue-300 text-center py-8">Ask questions about research</p>
                     ) : (
                       chatHistory.map(chat => (
-                        <div key={chat.id}>
+                        <div key={chat.id || (chat.question + Math.random())}>
                           <p className="text-blue-300">Q: {chat.question}</p>
                           <p className="text-green-300">A: {chat.answer}</p>
                         </div>
@@ -305,12 +428,49 @@ function App() {
 
               </div>
             } />
-
             <Route path="/trending" element={<Trending />} />
             <Route path="/community" element={<Community />} />
             <Route path="/profile" element={<Profile user={user} />} />
           </Routes>
         </div>
+
+        {/* FULL-SCREEN OVERLAY (login-style) FOR SEARCH RESULTS */}
+        {showOverlay && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
+            <div className="bg-gradient-to-b from-blue-900 to-indigo-900 rounded-2xl p-8 w-full max-w-4xl max-h-[85vh] overflow-y-auto border border-white/20 shadow-2xl relative">
+              <div className="flex items-start justify-between mb-6">
+                <div>
+                  <h2 className="text-2xl font-bold text-white">Search Results</h2>
+                  <p className="text-blue-200 text-sm mt-1">Results for: <span className="font-medium text-blue-100">{searchInterest}</span></p>
+                </div>
+                <div className="flex items-center space-x-3">
+                  {/* <button onClick={() => { setShowOverlay(false); }} className="text-blue-200 hover:text-white">Close</button>
+                  <button onClick={() => { setOverlayResults([]); setShowOverlay(false); }} className="text-blue-200 hover:text-white">✕</button> */}
+                </div>
+              </div>
+
+              {overlayResults.length === 0 ? (
+                <p className="text-blue-200">No results found.</p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {overlayResults.map((res, idx) => (
+                    <div key={res.id || res.title || idx}
+                      onClick={() => selectDocument(res)}
+                      className="p-4 rounded-lg bg-white/5 hover:bg-blue-700/40 cursor-pointer border border-white/10 transition-colors"
+                    >
+                      <h3 className="text-lg font-semibold text-white mb-1">{res.title || res.name || "Untitled"}</h3>
+                      {res.authors && <p className="text-sm text-blue-200 mb-1">Authors: {Array.isArray(res.authors) ? res.authors.join(", ") : res.authors}</p>}
+                      {res.year && <p className="text-sm text-blue-300">Year: {res.year}</p>}
+                      {res.summary && <p className="text-sm text-blue-200 mt-2 line-clamp-3">{res.summary}</p>}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <button onClick={() => setShowOverlay(false)} className="absolute top-4 right-4 text-blue-200 hover:text-white">✕</button>
+            </div>
+          </div>
+        )}
 
         {/* FOOTER */}
         <footer className="bg-white/15 backdrop-blur-lg border-t border-white/20 py-4 mt-6">

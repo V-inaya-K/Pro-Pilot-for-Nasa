@@ -1,6 +1,6 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from starlette.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 from pathlib import Path
@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 import google.generativeai as genai
 from contextlib import asynccontextmanager
+import httpx
+from bs4 import BeautifulSoup
 
 # ---------------- Load environment ----------------
 ROOT_DIR = Path(__file__).parent
@@ -45,7 +47,6 @@ api_router = APIRouter(prefix="/api")
 class User(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     email: str
-    uploads_used: int = 0
     interests: List[str] = []
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -105,9 +106,9 @@ def chunk_text(text: str, max_chars: int = MAX_CHARS):
 
 async def generate_summary(content: str, language: str = "english", tone: str = "professional") -> str:
     base_prompts = {
-        "english": "Summarize this legal document in {style} English.",
-        "hindi": "इस कानूनी दस्तावेज़ का सारांश {style} हिंदी में प्रस्तुत करें।",
-        "punjabi": "ਇਸ ਕਾਨੂੰਨੀ ਦਸਤਾਵੇਜ਼ ਦਾ ਸਾਰ {style} ਪੰਜਾਬੀ ਵਿੱਚ ਪੇਸ਼ ਕਰੋ।"
+        "english": "Summarize the following scientific research paper in {style} English.",
+        "hindi": "इस वैज्ञानिक शोध पत्र का सारांश {style} हिंदी में प्रस्तुत करें।",
+        "punjabi": "ਇਸ ਵਿਗਿਆਨਕ ਰਿਸਰਚ ਪੇਪਰ ਦਾ ਸਾਰ {style} ਪੰਜਾਬੀ ਵਿੱਚ ਪੇਸ਼ ਕਰੋ।"
     }
     tone_map = {
         "professional": "clear, professional",
@@ -154,9 +155,9 @@ async def get_answer(document_content: str, question: str, language: str = "engl
     style = tone_map.get(tone, "clear, professional")
 
     prompts = {
-        "english": f"Based on the following legal document, answer this question in {style} English: {question}\n\n{document_content}",
-        "hindi": f"निम्नलिखित कानूनी दस्तावेज़ के आधार पर इस प्रश्न का उत्तर {style} हिंदी में दें: {question}\n\n{document_content}",
-        "punjabi": f"ਹੇਠ ਲਿਖੇ ਕਾਨੂੰਨੀ ਦਸਤਾਵੇਜ਼ ਦੇ ਆਧਾਰ 'ਤੇ ਇਸ ਸਵਾਲ ਦਾ ਜਵਾਬ {style} ਪੰਜਾਬੀ ਵਿੱਚ ਦਿਓ: {question}\n\n{document_content}"
+        "english": f"Based on the following research paper, answer this question in {style} English: {question}\n\n{document_content}",
+        "hindi": f"निम्नलिखित शोध पत्र के आधार पर इस प्रश्न का उत्तर {style} हिंदी में दें: {question}\n\n{document_content}",
+        "punjabi": f"ਹੇਠ ਲਿਖੇ ਰਿਸਰਚ ਪੇਪਰ ਦੇ ਆਧਾਰ 'ਤੇ ਇਸ ਸਵਾਲ ਦਾ ਜਵਾਬ {style} ਪੰਜਾਬੀ ਵਿੱਚ ਦਿਓ: {question}\n\n{document_content}"
     }
 
     prompt = prompts.get(language, prompts["english"])
@@ -173,12 +174,38 @@ async def get_answer(document_content: str, question: str, language: str = "engl
         return f"Error getting answer: {str(e)}"
 
 # ---------------- API Routes ----------------
+@api_router.get("/genelab_search")
+async def genelab_search(query: str):
+    """
+    Scrapes NASA science data site and returns results matching query
+    """
+    url = "https://science.nasa.gov/biological-physical/data/"
+    headers = {"User-Agent": "ProPilotApp/1.0"}
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            html = response.text
+
+        # Parse HTML for links containing the query
+        soup = BeautifulSoup(html, "html.parser")
+        datasets = []
+        for link in soup.select("a"):
+            title = link.get_text(strip=True)
+            href = link.get("href")
+            if query.lower() in title.lower() and href:
+                datasets.append({"title": title, "link": href})
+
+        return {"results": datasets}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"Error fetching GeneLab data: {str(e)}"})
+
+
 @api_router.post("/users", response_model=User)
 async def create_user(user_data: UserCreate):
-    # Check if user already exists
     existing = await db.users.find_one({"email": user_data.email})
     if existing:
-        # Update interests if new ones are provided
         if user_data.interests:
             await db.users.update_one(
                 {"email": user_data.email},
@@ -186,15 +213,9 @@ async def create_user(user_data: UserCreate):
             )
         return User(**existing)
 
-    # Create new user
-    user_obj = User(
-        email=user_data.email,
-        # Store interests if provided
-        **({"interests": user_data.interests} if user_data.interests else {})
-    )
+    user_obj = User(email=user_data.email, **({"interests": user_data.interests} if user_data.interests else {}))
     await db.users.insert_one(user_obj.dict())
     return user_obj
-
 
 @api_router.get("/users/{email}", response_model=User)
 async def get_user(email: str):
@@ -204,21 +225,15 @@ async def get_user(email: str):
     return User(**user)
 
 @api_router.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    user_id: str = Form(...),
-    tone: str = Form("professional")
-):
+async def upload_document(file: UploadFile = File(...), user_id: str = Form(...), tone: str = Form("professional")):
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user_obj = User(**user)
-    if user_obj.uploads_used >= 2:
-        return JSONResponse(status_code=402, content={"detail": "Free uploads exceeded. ₹50 required."})
 
     content = await file.read()
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
     text_content = extract_text_from_pdf(content)
     if not text_content.strip():
         raise HTTPException(status_code=400, detail="No text extracted")
@@ -237,13 +252,11 @@ async def upload_document(
         file_type="pdf"
     )
     await db.documents.insert_one(document.dict())
-    await db.users.update_one({"id": user_id}, {"$inc": {"uploads_used": 1}})
 
     return {
         "document_id": document.id,
         "message": "Document uploaded and summarized",
         "summary": {"english": summary_en, "hindi": summary_hi, "punjabi": summary_pa},
-        "uploads_remaining": 2 - (user_obj.uploads_used + 1)
     }
 
 @api_router.get("/documents/{user_id}", response_model=List[Document])
@@ -263,6 +276,7 @@ async def ask_question(chat_request: ChatRequest):
     document = await db.documents.find_one({"id": chat_request.document_id})
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
+
     answer = await get_answer(document["content"], chat_request.question, chat_request.language, chat_request.tone)
     chat_message = ChatMessage(
         document_id=chat_request.document_id,
@@ -284,8 +298,8 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=["*"],  # allow all origins
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
