@@ -348,21 +348,96 @@ async def get_document(document_id: str):
         raise HTTPException(status_code=404, detail="Document not found")
     return Document(**doc)
 
-# 6) Chat endpoints
 @api_router.post("/chat", response_model=ChatMessage)
 async def ask_question(chat_request: ChatRequest):
+    """
+    Handles chat queries for both uploaded and external NASA research documents.
+    Uses the document summary (or fetches and generates it if missing).
+    """
+    # Try to find document in DB
     document = await db.documents.find_one({"id": chat_request.document_id})
+
     if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
+        osd_id = chat_request.document_id  # Assuming this might be an OSD_ID (e.g., OSD-1234)
+        logger.info(f"📡 Document {osd_id} not found — attempting to fetch from NASA OSDR API")
+
+        try:
+            # Fetch metadata from NASA
+            resp = requests.get(f"{METADATA_API_URL}/{osd_id.replace('OSD-', '')}", timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            study_container = data.get("study", {})
+            study_key = f"OSD-{osd_id.replace('OSD-', '')}"
+            study_data = study_container.get(study_key, {})
+            study_main = study_data.get("studies", [{}])[0] if isinstance(study_data, dict) else {}
+
+            title = study_main.get("title") or study_data.get("title") or f"NASA Study {osd_id}"
+            description = (
+                study_main.get("description")
+                or study_main.get("Study Description")
+                or study_main.get("summary")
+                or "No description found."
+            )
+            doi_link = (
+                study_main.get("doi")
+                or study_main.get("DOI")
+                or "https://osdr.nasa.gov/"
+            )
+
+            # 🧠 Generate summaries using Groq
+            summary_en = await generate_summary(description, "english")
+            summary_hi = await generate_summary(description, "hindi")
+            summary_pa = await generate_summary(description, "punjabi")
+
+            # 💾 Save into DB
+            new_doc = Document(
+                id=osd_id,  # Use NASA OSD_ID as document ID
+                user_id=chat_request.user_id,
+                filename=f"{title}.nasa",
+                content=description,
+                summary=summary_en,
+                summary_hindi=summary_hi,
+                summary_punjabi=summary_pa,
+                doi_link=doi_link,
+                file_type="nasa"
+            )
+            await db.documents.insert_one(new_doc.dict())
+            document = new_doc.dict()
+            logger.info(f"✅ Saved new NASA document: {osd_id}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch NASA study for {osd_id}: {e}")
+            raise HTTPException(status_code=404, detail=f"Could not fetch NASA study: {str(e)}")
+
+    # --- Pick summary in correct language ---
+    language = chat_request.language
+    if language == "hindi":
+        document_summary = document.get("summary_hindi") or document.get("summary")
+    elif language == "punjabi":
+        document_summary = document.get("summary_punjabi") or document.get("summary")
+    else:
+        document_summary = document.get("summary")
+
+    if not document_summary:
+        document_summary = document.get("content", "")[:4000]
+
+    # --- Previous chats for context ---
     prev_msgs_data = await db.chat_messages.find({
         "document_id": chat_request.document_id,
         "user_id": chat_request.user_id
     }).sort("timestamp", 1).to_list(length=None)
-    
     prev_msgs = [ChatMessage(**m) for m in prev_msgs_data]
-    answer = await get_answer(document["content"], chat_request.question, prev_msgs, chat_request.language, chat_request.tone)
-    
+
+    # --- Generate answer using LLM ---
+    answer = await get_answer(
+        document_summary,
+        chat_request.question,
+        prev_msgs,
+        chat_request.language,
+        chat_request.tone
+    )
+
+    # --- Save chat message ---
     chat_message = ChatMessage(
         document_id=chat_request.document_id,
         user_id=chat_request.user_id,
@@ -371,7 +446,9 @@ async def ask_question(chat_request: ChatRequest):
         language=chat_request.language
     )
     await db.chat_messages.insert_one(chat_message.dict())
+
     return chat_message
+
 
 @api_router.get("/chat/{document_id}/{user_id}", response_model=List[ChatMessage])
 async def get_chat_history(document_id: str, user_id: str):
